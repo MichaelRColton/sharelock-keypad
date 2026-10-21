@@ -1,5 +1,5 @@
 // Offline cache for the keypad page, so it opens from the home screen without a network.
-const CACHE = "sharelock-keypad-v3";
+const CACHE = "sharelock-keypad-v4";
 const FILES = ["./", "index.html", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))));
 self.addEventListener("activate", e => e.waitUntil(

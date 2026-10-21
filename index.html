@@ -190,13 +190,14 @@ async function autoConnect() {
   }
   if (connected() || connecting) return;
   if (!navigator.bluetooth.getDevices) {
-    show("none", "Not connected", "Tap a key or Connect to choose your lock");
+    // Chrome without remembered devices (chrome://flags: "Web Bluetooth new permissions backend")
+    show("none", "Not connected", "Tap a key to connect (this Chrome can't reconnect by itself)");
     return;
   }
   const devs = await navigator.bluetooth.getDevices();
   const dev = devs.find(d => d.id === remembered()) || devs.find(d => (d.name || "").startsWith("SLOCK"));
   if (!dev) {
-    show("none", "Not connected", "Tap a key or Connect to choose your lock");
+    show("none", "Not connected", "Tap a key or Connect to choose your lock (none remembered yet)");
     return;
   }
   device = dev;
