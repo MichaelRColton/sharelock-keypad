@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ShareLock Keypad</title>
+<meta name="description" content="Bluetooth keypad demo for the ShareLock WB55 board">
+<meta name="theme-color" content="#14171c">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --text: #15181d; --muted: #6a7280;
+    --key: #ffffff; --key-press: #dfe3ea; --border: #d5d9e0;
+    --locked: #c0392b; --unlocked: #1e8e4e; --idle: #8a919c; --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171c; --panel: #1d2128; --text: #eef0f3; --muted: #9aa3af;
+      --key: #252a33; --key-press: #343b47; --border: #313845;
+      --locked: #e5534b; --unlocked: #3fb950; --idle: #6e7681; --accent: #58a6ff;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171c; --panel: #1d2128; --text: #eef0f3; --muted: #9aa3af;
+    --key: #252a33; --key-press: #343b47; --border: #313845;
+    --locked: #e5534b; --unlocked: #3fb950; --idle: #6e7681; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; justify-content: center;
+    padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+    user-select: none;
+  }
+  main { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 18px; padding: 20px 0; }
+  .status {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+    padding: 18px; display: flex; align-items: center; gap: 14px;
+  }
+  .lamp { width: 54px; height: 54px; border-radius: 50%; flex: none; display: grid; place-items: center;
+          background: var(--idle); transition: background .2s; }
+  .lamp svg { width: 28px; height: 28px; fill: none; stroke: #fff; stroke-width: 2.2; stroke-linecap: round; }
+  .status[data-lock="locked"] .lamp { background: var(--locked); }
+  .status[data-lock="unlocked"] .lamp { background: var(--unlocked); }
+  .state { font-size: 26px; font-weight: 650; letter-spacing: .02em; }
+  .sub { color: var(--muted); font-size: 14px; }
+  .entry { height: 28px; text-align: center; font-size: 24px; letter-spacing: .35em; color: var(--muted);
+           font-variant-numeric: tabular-nums; overflow: hidden; }
+  .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .pad button {
+    aspect-ratio: 1.25; border-radius: 16px; border: 1px solid var(--border);
+    background: var(--key); color: var(--text); font-size: 30px; font-weight: 500;
+    touch-action: manipulation; transition: background .08s, transform .08s;
+  }
+  .pad button:active, .pad button.hit { background: var(--key-press); transform: scale(.97); }
+  .pad button:disabled { opacity: .35; }
+  .connect {
+    border: 0; border-radius: 14px; padding: 15px; font-size: 17px; font-weight: 600;
+    background: var(--accent); color: #fff;
+  }
+  .connect.secondary { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+  .note { color: var(--muted); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <section class="status" id="status" data-lock="none" aria-live="polite">
+    <div class="lamp" aria-hidden="true">
+      <svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path id="shackle" d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+    </div>
+    <div>
+      <div class="state" id="state">Not connected</div>
+      <div class="sub" id="sub">Tap Connect and pick your lock</div>
+    </div>
+  </section>
+
+  <div class="entry" id="entry" aria-hidden="true"></div>
+
+  <div class="pad" id="pad">
+    <button data-k="1">1</button><button data-k="2">2</button><button data-k="3">3</button>
+    <button data-k="4">4</button><button data-k="5">5</button><button data-k="6">6</button>
+    <button data-k="7">7</button><button data-k="8">8</button><button data-k="9">9</button>
+    <button data-k="*" aria-label="Clear">*</button><button data-k="0">0</button><button data-k="#" aria-label="Enter">#</button>
+  </div>
+
+  <button class="connect" id="connect">Connect</button>
+  <p class="note" id="note">Each key is sent to the lock as you press it, just like its own keypad.</p>
+</main>
+
+<script>
+const SERVICE = "534c0001-8d6b-4b7e-9c1a-2f4e6a8b0c1d";
+const KEYS    = "534c0002-8d6b-4b7e-9c1a-2f4e6a8b0c1d";
+const STATE   = "534c0003-8d6b-4b7e-9c1a-2f4e6a8b0c1d";
+
+const $ = id => document.getElementById(id);
+let device = null, keysChar = null, sendChain = Promise.resolve(), entryTimer = 0;
+
+function show(lock, title, sub) {
+  $("status").dataset.lock = lock;
+  $("state").textContent = title;
+  $("sub").textContent = sub;
+  $("shackle").setAttribute("d", lock === "unlocked" ? "M8 11V7a4 4 0 0 1 8 0" : "M8 11V7a4 4 0 0 1 8 0v4");
+}
+
+function setConnected(on) {
+  document.querySelectorAll("#pad button").forEach(b => b.disabled = !on);
+  $("connect").textContent = on ? "Disconnect" : "Connect";
+  $("connect").classList.toggle("secondary", on);
+}
+
+function onState(value) {
+  const unlocked = value.getUint8(0) === 1;
+  show(unlocked ? "unlocked" : "locked", unlocked ? "Unlocked" : "Locked", device ? device.name : "");
+  if (unlocked && navigator.vibrate) navigator.vibrate(60);
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    show("none", "No Bluetooth here", "Use Chrome on Android (or desktop Chrome/Edge)");
+    return;
+  }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "SLOCK" }, { services: [SERVICE] }],
+      optionalServices: [SERVICE],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnect);
+    show("none", "Connecting…", device.name);
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    keysChar = await svc.getCharacteristic(KEYS);
+    const stateChar = await svc.getCharacteristic(STATE);
+    stateChar.addEventListener("characteristicvaluechanged", e => onState(e.target.value));
+    await stateChar.startNotifications();
+    onState(await stateChar.readValue());
+    setConnected(true);
+  } catch (err) {
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    device = null; keysChar = null;
+    setConnected(false);
+    show("none", "Not connected", err.name === "NotFoundError" ? "No lock chosen" : err.message);
+  }
+}
+
+function onDisconnect() {
+  keysChar = null;
+  setConnected(false);
+  show("none", "Disconnected", "Tap Connect to reconnect");
+}
+
+function press(k, btn) {
+  if (!keysChar) return;
+  if (btn) { btn.classList.add("hit"); setTimeout(() => btn.classList.remove("hit"), 120); }
+  if (navigator.vibrate) navigator.vibrate(15);
+  // feedback line: digits as dots, cleared by * or # or after a pause
+  const e = $("entry");
+  e.textContent = (k === "*" || k === "#") ? "" : (e.textContent + "•").slice(-8);
+  clearTimeout(entryTimer);
+  entryTimer = setTimeout(() => e.textContent = "", 5000);
+  // one write at a time, in order (GATT allows only one operation in flight)
+  const data = new TextEncoder().encode(k);
+  sendChain = sendChain.then(() => keysChar && keysChar.writeValueWithResponse(data))
+    .catch(err => show($("status").dataset.lock, $("state").textContent, "Send failed: " + err.message));
+}
+
+$("pad").addEventListener("click", e => {
+  const b = e.target.closest("button[data-k]");
+  if (b) press(b.dataset.k, b);
+});
+document.addEventListener("keydown", e => {
+  if (/^[0-9*#]$/.test(e.key)) press(e.key, document.querySelector(`[data-k="${CSS.escape(e.key)}"]`));
+});
+$("connect").addEventListener("click", () => device && device.gatt.connected ? device.gatt.disconnect() : connect());
+
+setConnected(false);
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
