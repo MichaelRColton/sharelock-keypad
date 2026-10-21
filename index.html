@@ -73,7 +73,7 @@
     </div>
     <div>
       <div class="state" id="state">Not connected</div>
-      <div class="sub" id="sub">Tap Connect and pick your lock</div>
+      <div class="sub" id="sub">Tap a key or Connect to choose your lock</div>
     </div>
   </section>
 
@@ -87,7 +87,7 @@
   </div>
 
   <button class="connect" id="connect">Connect</button>
-  <p class="note" id="note">Each key is sent to the lock as you press it, just like its own keypad.</p>
+  <p class="note" id="note">Each key is sent to the lock as you press it, just like its own keypad. It reconnects to the last lock you chose whenever you open it.</p>
 </main>
 
 <script>
@@ -96,7 +96,9 @@ const KEYS    = "534c0002-8d6b-4b7e-9c1a-2f4e6a8b0c1d";
 const STATE   = "534c0003-8d6b-4b7e-9c1a-2f4e6a8b0c1d";
 
 const $ = id => document.getElementById(id);
+const LAST = "sharelock-last-lock";       // id of the lock picked last time
 let device = null, keysChar = null, sendChain = Promise.resolve(), entryTimer = 0;
+let connecting = null, watchTimer = 0, pending = [];
 
 function show(lock, title, sub) {
   $("status").dataset.lock = lock;
@@ -105,9 +107,10 @@ function show(lock, title, sub) {
   $("shackle").setAttribute("d", lock === "unlocked" ? "M8 11V7a4 4 0 0 1 8 0" : "M8 11V7a4 4 0 0 1 8 0v4");
 }
 
+function connected() { return !!(keysChar && device && device.gatt.connected); }
+
 function setConnected(on) {
-  document.querySelectorAll("#pad button").forEach(b => b.disabled = !on);
-  $("connect").textContent = on ? "Disconnect" : "Connect";
+  $("connect").textContent = on ? "Choose another lock" : "Connect";
   $("connect").classList.toggle("secondary", on);
 }
 
@@ -117,42 +120,130 @@ function onState(value) {
   if (unlocked && navigator.vibrate) navigator.vibrate(60);
 }
 
-async function connect() {
+function remember(id) { try { localStorage.setItem(LAST, id); } catch (e) {} }
+function remembered() { try { return localStorage.getItem(LAST); } catch (e) { return null; } }
+
+function withTimeout(promise, ms, what) {
+  let t;
+  return Promise.race([promise, new Promise((_, rej) => t = setTimeout(() => rej(new Error(what)), ms))])
+    .finally(() => clearTimeout(t));
+}
+
+// Connect to a lock we already have permission for, then send any keys pressed meanwhile.
+function openLock(dev) {
+  if (connecting) return connecting;
+  if (device && device !== dev && device.gatt.connected) device.gatt.disconnect();
+  device = dev;
+  if (!dev._listening) { dev.addEventListener("gattserverdisconnected", onDisconnect); dev._listening = true; }
+  show("none", "Connecting…", dev.name || "");
+  connecting = (async () => {
+    try {
+      const server = await withTimeout(dev.gatt.connect(), 12000, "Lock not responding");
+      const svc = await server.getPrimaryService(SERVICE);
+      keysChar = await svc.getCharacteristic(KEYS);
+      const stateChar = await svc.getCharacteristic(STATE);
+      stateChar.addEventListener("characteristicvaluechanged", e => onState(e.target.value));
+      await stateChar.startNotifications();
+      onState(await stateChar.readValue());
+      remember(dev.id);
+      setConnected(true);
+      const keys = pending.join(""); pending = [];
+      for (const k of keys) send(k);
+    } catch (err) {
+      if (dev.gatt.connected) dev.gatt.disconnect();
+      keysChar = null; pending = [];
+      $("entry").textContent = "";
+      setConnected(false);
+      show("none", "Not connected", err.message + " — tap a key to retry");
+    } finally {
+      connecting = null;
+    }
+  })();
+  return connecting;
+}
+
+// Ask the user to pick a lock (Chrome's chooser: only allowed from a tap).
+async function pickLock() {
+  if (!navigator.bluetooth) {
+    show("none", "No Bluetooth here", "Use Chrome on Android (or desktop Chrome/Edge)");
+    pending = [];
+    return;
+  }
+  try {
+    const dev = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "SLOCK" }, { services: [SERVICE] }],
+      optionalServices: [SERVICE],
+    });
+    await openLock(dev);
+  } catch (err) {
+    pending = []; $("entry").textContent = "";
+    show("none", "Not connected", err.name === "NotFoundError" ? "No lock chosen — tap a key to choose" : err.message);
+  }
+}
+
+// On opening: reconnect to the lock picked last time, without the chooser, if Chrome
+// supports remembering it (getDevices). Waits for it to advertise, so it only
+// connects when the lock is in range.
+async function autoConnect() {
   if (!navigator.bluetooth) {
     show("none", "No Bluetooth here", "Use Chrome on Android (or desktop Chrome/Edge)");
     return;
   }
-  try {
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ namePrefix: "SLOCK" }, { services: [SERVICE] }],
-      optionalServices: [SERVICE],
-    });
-    device.addEventListener("gattserverdisconnected", onDisconnect);
-    show("none", "Connecting…", device.name);
-    const server = await device.gatt.connect();
-    const svc = await server.getPrimaryService(SERVICE);
-    keysChar = await svc.getCharacteristic(KEYS);
-    const stateChar = await svc.getCharacteristic(STATE);
-    stateChar.addEventListener("characteristicvaluechanged", e => onState(e.target.value));
-    await stateChar.startNotifications();
-    onState(await stateChar.readValue());
-    setConnected(true);
-  } catch (err) {
-    if (device && device.gatt.connected) device.gatt.disconnect();
-    device = null; keysChar = null;
-    setConnected(false);
-    show("none", "Not connected", err.name === "NotFoundError" ? "No lock chosen" : err.message);
+  if (connected() || connecting) return;
+  if (!navigator.bluetooth.getDevices) {
+    show("none", "Not connected", "Tap a key or Connect to choose your lock");
+    return;
   }
+  const devs = await navigator.bluetooth.getDevices();
+  const dev = devs.find(d => d.id === remembered()) || devs.find(d => (d.name || "").startsWith("SLOCK"));
+  if (!dev) {
+    show("none", "Not connected", "Tap a key or Connect to choose your lock");
+    return;
+  }
+  device = dev;
+  if (!dev.watchAdvertisements) { openLock(dev); return; }
+  show("none", "Looking for " + (dev.name || "your lock") + "…", "Waiting for it to come in range");
+  const seen = () => {
+    dev.removeEventListener("advertisementreceived", seen);
+    clearTimeout(watchTimer);
+    stopWatching(dev);
+    if (!document.hidden) openLock(dev);
+  };
+  dev.addEventListener("advertisementreceived", seen);
+  try {
+    await dev.watchAdvertisements();
+  } catch (err) {
+    dev.removeEventListener("advertisementreceived", seen);
+    openLock(dev);                        // can't watch: just try to connect
+    return;
+  }
+  clearTimeout(watchTimer);
+  watchTimer = setTimeout(() => {
+    dev.removeEventListener("advertisementreceived", seen);
+    stopWatching(dev);
+    if (!connected() && !connecting)
+      show("none", (dev.name || "Your lock") + " not in range", "Tap a key to try again, or Connect to choose another");
+  }, 15000);
+}
+
+function stopWatching(dev) {
+  if (dev && dev.watchingAdvertisements && dev.unwatchAdvertisements) dev.unwatchAdvertisements();
 }
 
 function onDisconnect() {
   keysChar = null;
   setConnected(false);
-  show("none", "Disconnected", "Tap Connect to reconnect");
+  if (!document.hidden) show("none", "Disconnected", "Tap a key to reconnect");
+}
+
+function send(k) {
+  const data = new TextEncoder().encode(k);
+  // one write at a time, in order (GATT allows only one operation in flight)
+  sendChain = sendChain.then(() => keysChar && keysChar.writeValueWithResponse(data))
+    .catch(err => show($("status").dataset.lock, $("state").textContent, "Send failed: " + err.message));
 }
 
 function press(k, btn) {
-  if (!keysChar) return;
   if (btn) { btn.classList.add("hit"); setTimeout(() => btn.classList.remove("hit"), 120); }
   if (navigator.vibrate) navigator.vibrate(15);
   // feedback line: digits as dots, cleared by * or # or after a pause
@@ -160,10 +251,12 @@ function press(k, btn) {
   e.textContent = (k === "*" || k === "#") ? "" : (e.textContent + "•").slice(-8);
   clearTimeout(entryTimer);
   entryTimer = setTimeout(() => e.textContent = "", 5000);
-  // one write at a time, in order (GATT allows only one operation in flight)
-  const data = new TextEncoder().encode(k);
-  sendChain = sendChain.then(() => keysChar && keysChar.writeValueWithResponse(data))
-    .catch(err => show($("status").dataset.lock, $("state").textContent, "Send failed: " + err.message));
+  if (connected()) { send(k); return; }
+  // Not connected yet: keep the key and connect (this tap allows the chooser if needed)
+  if (pending.length < 20) pending.push(k);
+  if (connecting) return;
+  if (device && device.id === remembered()) openLock(device);
+  else pickLock();
 }
 
 $("pad").addEventListener("click", e => {
@@ -173,9 +266,27 @@ $("pad").addEventListener("click", e => {
 document.addEventListener("keydown", e => {
   if (/^[0-9*#]$/.test(e.key)) press(e.key, document.querySelector(`[data-k="${CSS.escape(e.key)}"]`));
 });
-$("connect").addEventListener("click", () => device && device.gatt.connected ? device.gatt.disconnect() : connect());
+$("connect").addEventListener("click", () => {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  pickLock();
+});
+
+// Connected only while the app is on screen: drop the link when it's closed or put
+// in the background (so the lock is free for other phones), reconnect on return.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(watchTimer);
+    stopWatching(device);
+    pending = [];
+    if (device && device.gatt.connected) device.gatt.disconnect();
+  } else {
+    autoConnect();
+  }
+});
+window.addEventListener("pagehide", () => { if (device && device.gatt.connected) device.gatt.disconnect(); });
 
 setConnected(false);
+autoConnect();
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
 </body>
