@@ -182,8 +182,7 @@ async function pickLock() {
 }
 
 // On opening: reconnect to the lock picked last time, without the chooser, if Chrome
-// supports remembering it (getDevices). Waits for it to advertise, so it only
-// connects when the lock is in range.
+// supports remembering it (getDevices).
 async function autoConnect() {
   if (!navigator.bluetooth) {
     show("none", "No Bluetooth here", "Use Chrome on Android (or desktop Chrome/Edge)");
@@ -201,29 +200,30 @@ async function autoConnect() {
     return;
   }
   device = dev;
-  if (!dev.watchAdvertisements) { openLock(dev); return; }
-  show("none", "Looking for " + (dev.name || "your lock") + "…", "Waiting for it to come in range");
+  // Try straight away: Chrome on Android remembers the lock but doesn't deliver its
+  // advertisements to watchAdvertisements(), so waiting for one never connects.
+  await openLock(dev);
+  if (connected() || document.hidden || !dev.watchAdvertisements) return;
+  // Not in range (or not answering): connect when it shows up, where Chrome can tell us.
+  show("none", (dev.name || "Your lock") + " not in range", "Tap a key to try again, or Connect to choose another");
   const seen = () => {
     dev.removeEventListener("advertisementreceived", seen);
     clearTimeout(watchTimer);
     stopWatching(dev);
-    if (!document.hidden) openLock(dev);
+    if (!document.hidden && !connected()) openLock(dev);
   };
   dev.addEventListener("advertisementreceived", seen);
   try {
     await dev.watchAdvertisements();
   } catch (err) {
     dev.removeEventListener("advertisementreceived", seen);
-    openLock(dev);                        // can't watch: just try to connect
     return;
   }
   clearTimeout(watchTimer);
   watchTimer = setTimeout(() => {
     dev.removeEventListener("advertisementreceived", seen);
     stopWatching(dev);
-    if (!connected() && !connecting)
-      show("none", (dev.name || "Your lock") + " not in range", "Tap a key to try again, or Connect to choose another");
-  }, 15000);
+  }, 60000);
 }
 
 function stopWatching(dev) {
